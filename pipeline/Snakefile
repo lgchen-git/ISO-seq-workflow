@@ -1,0 +1,162 @@
+import csv
+from pathlib import Path
+
+shell.executable('/bin/bash')
+shell.prefix('set -euo pipefail; ')
+with open(config['samples_tsv'], newline='') as handle:
+    SAMPLE_ROWS = list(csv.DictReader(handle, delimiter='\t'))
+SAMPLES = {r['sample_id']: r['fastq'] for r in SAMPLE_ROWS}
+with open(config['contrasts_tsv'], newline='') as handle:
+    CONTRASTS = list(csv.DictReader(handle, delimiter='\t'))
+assert SAMPLES and len(SAMPLES) == len(SAMPLE_ROWS), 'Sample table is empty or has duplicate sample IDs'
+O = config['outputs_root']
+T = config['scratch_root']
+P = O + '/_project'
+D = P + '/00_preflight/design.json'
+FA = str(Path(config['reference_fasta']).resolve())
+LOCAL_FA = T + '/reference/genome.fa'
+GTF = T + '/reference/genes.gtf'
+MMI = T + '/reference/genome.splice.mmi'
+JB = T + '/reference/junctions.bed'
+THREADS = int(config.get('threads', 8))
+CATALOG_THREADS = int(config.get('catalog_threads', 16))
+CFG = workflow.configfiles[0]
+SCRIPT = 'pipeline/scripts/analyze.py'
+REPORT = 'pipeline/scripts/report.py'
+DESIGN_VALIDATOR = 'pipeline/scripts/design.py'
+DIFFERENTIAL = 'pipeline/scripts/differential.R'
+FLOW_TABLES = 'pipeline/scripts/build_read_flow_tables.py'
+FLOW_RENDERER = 'pipeline/scripts/build_read_flow_sankey.py'
+FLOW_VALIDATOR = 'pipeline/scripts/validate_read_flow_outputs.py'
+FLOW_DIR = P + '/09_report/read_flow'
+FLOW_FRAGMENT = FLOW_DIR + '/reports/read_flow_sankey_section.html'
+PLOTLY_JS = 'pipeline/assets/plotly-3.5.1.min.js'
+
+rule all:
+    input: P + '/RUN_COMPLETE.tsv'
+
+rule preflight:
+    input: samples=config['samples_tsv'], contrasts=config['contrasts_tsv'], validator=DESIGN_VALIDATOR
+    output: D
+    params: root=str(Path.cwd()), minimum=int(config.get('min_replicates_per_group', 2))
+    log: 'log/preflight.log'
+    resources: mem_mb=1024
+    shell: 'python {input.validator:q} --samples {input.samples:q} --contrasts {input.contrasts:q} --project-root {params.root:q} --min-replicates {params.minimum} --output {output:q} > {log:q} 2>&1'
+
+rule local_fasta:
+    input: fasta=FA, design=D
+    output: fasta=LOCAL_FA, fai=LOCAL_FA + '.fai'
+    log: 'log/local_fasta.log'
+    resources: mem_mb=2048
+    shell: 'ln -sfn {input.fasta:q} {output.fasta:q}; samtools faidx {output.fasta:q} > {log:q} 2>&1'
+
+rule prepare_reference:
+    input: fasta=FA, gtf=config['reference_gtf'], script=SCRIPT, design=D
+    output: gtf=GTF, mmi=MMI, junctions=JB
+    log: 'log/reference.log'
+    threads: THREADS
+    resources: mem_mb=24000
+    shell: 'python {input.script:q} reference --config {CFG:q} > {log:q} 2>&1'
+
+rule raw_qc:
+    input: fastq=lambda w: SAMPLES[w.sample], script=SCRIPT, design=D
+    output: O + '/{sample}/01_raw_qc/qc.json', O + '/{sample}/01_raw_qc/lengths.tsv'
+    log: 'log/{sample}.raw_qc.log'
+    resources: mem_mb=2048
+    shell: 'python {input.script:q} qc --config {CFG:q} --sample {wildcards.sample:q} > {log:q} 2>&1'
+
+rule adapters:
+    input: fastq=lambda w: SAMPLES[w.sample], design=D
+    output: fastq=temp(T + '/{sample}/adapters.fastq.gz'), summary=O + '/{sample}/02_trim/cutadapt.json'
+    params: pair=config['primer_5p'] + '...' + config['adapter_3p'], error=config['adapter_error_rate'], overlap=config['adapter_min_overlap']
+    log: 'log/{sample}.cutadapt.log'
+    threads: THREADS
+    resources: mem_mb=4096
+    shell: 'cutadapt --revcomp -g {params.pair:q} -e {params.error} -O {params.overlap} --discard-untrimmed -j {threads} --json {output.summary:q} -o {output.fastq:q} {input.fastq:q} > {log:q} 2>&1'
+
+rule orient:
+    input: fastq=T + '/{sample}/adapters.fastq.gz', cutadapt=O + '/{sample}/02_trim/cutadapt.json', script=SCRIPT
+    output: fastq=T + '/{sample}/insert.fastq.gz', metadata=T + '/{sample}/trim_metadata.tsv.gz', summary=O + '/{sample}/02_trim/trim_summary.json', qc=O + '/{sample}/02_trim/insert_qc.json'
+    log: 'log/{sample}.orient.log'
+    params: settings={k: config[k] for k in ['poly_t_min', 'poly_t_window', 'min_insert_length']}
+    resources: mem_mb=4096
+    shell: 'python {input.script:q} orient --config {CFG:q} --sample {wildcards.sample:q} > {log:q} 2>&1'
+
+rule align:
+    input: fastq=T + '/{sample}/insert.fastq.gz', mmi=MMI, junctions=JB, script=SCRIPT
+    output: bam=O + '/{sample}/03_alignment/aligned.sorted.bam', bai=O + '/{sample}/03_alignment/aligned.sorted.bam.bai', primary=O + '/{sample}/03_alignment/primary.q20.bam', primary_index=O + '/{sample}/03_alignment/primary.q20.bam.bai', qc=O + '/{sample}/03_alignment/alignment.json'
+    log: 'log/{sample}.alignment.log'
+    params: mapq=config['mapq']
+    threads: THREADS
+    resources: mem_mb=24000
+    shell: 'python {input.script:q} align --config {CFG:q} --sample {wildcards.sample:q} --threads {threads} > {log:q} 2>&1'
+
+rule isoquant:
+    input: bams=expand(O + '/{sample}/03_alignment/primary.q20.bam', sample=SAMPLES), indexes=expand(O + '/{sample}/03_alignment/primary.q20.bam.bai', sample=SAMPLES), gtf=GTF, fasta=LOCAL_FA, fai=LOCAL_FA + '.fai'
+    output: directory(P + '/04_catalog/isoquant')
+    params: labels=list(SAMPLES), out=P + '/04_catalog/isoquant'
+    log: 'log/isoquant.log'
+    threads: CATALOG_THREADS
+    resources: mem_mb=64000
+    shell: 'isoquant --reference {input.fasta:q} --genedb {input.gtf:q} --complete_genedb --bam {input.bams:q} --labels {params.labels:q} --data_type nanopore --mode bulk --read_group file_name --use_replicas false --report_novel_unspliced true --gene_quantification unique_only --transcript_quantification unique_only --prefix catalog --output {params.out:q} --threads {threads} --force > {log:q} 2>&1'
+
+rule sqanti:
+    input: iq=P + '/04_catalog/isoquant', gtf=GTF, fasta=LOCAL_FA, fai=LOCAL_FA + '.fai', script=SCRIPT
+    output: directory(P + '/05_structure_qc/sqanti3')
+    log: 'log/sqanti3.log'
+    threads: THREADS
+    resources: mem_mb=48000
+    shell: 'python {input.script:q} sqanti --config {CFG:q} --threads {threads} > {log:q} 2>&1'
+
+rule quantification:
+    input: iq=P + '/04_catalog/isoquant', sq=P + '/05_structure_qc/sqanti3', script=SCRIPT
+    output: catalog=P + '/06_quantification/catalog.tsv', gtf=P + '/06_quantification/filtered.gtf',
+        counts=P + '/06_quantification/isoform_counts.tsv', tpm=P + '/06_quantification/isoform_tpm.tsv',
+        usage=P + '/06_quantification/isoform_usage.tsv', summary=P + '/06_quantification/summary.json',
+        reference_gene_counts=P + '/06_quantification/reference_gene_counts.tsv',
+        reference_gene_tpm=P + '/06_quantification/reference_gene_tpm.tsv',
+        reference_transcript_counts=P + '/06_quantification/reference_transcript_counts.tsv',
+        reference_transcript_tpm=P + '/06_quantification/reference_transcript_tpm.tsv'
+    log: 'log/quantification.log'
+    resources: mem_mb=16000
+    shell: 'python {input.script:q} quantify --config {CFG:q} > {log:q} 2>&1'
+
+rule events:
+    input: catalog=P + '/06_quantification/catalog.tsv', gtf=P + '/06_quantification/filtered.gtf', counts=P + '/06_quantification/isoform_counts.tsv', tpm=P + '/06_quantification/isoform_tpm.tsv', bams=expand(O + '/{sample}/03_alignment/primary.q20.bam', sample=SAMPLES), metadata=expand(T + '/{sample}/trim_metadata.tsv.gz', sample=SAMPLES), iq=P + '/04_catalog/isoquant', script=SCRIPT
+    output: psi=P + '/07_events/psi.tsv', ends=P + '/07_events/terminal_candidates.tsv', summary=P + '/07_events/events.json'
+    log: 'log/events.log'
+    params: settings={k: config[k] for k in ['event_min_reads', 'end_window', 'end_min_reads']}
+    threads: 2
+    resources: mem_mb=32000
+    shell: 'python {input.script:q} events --config {CFG:q} > {log:q} 2>&1'
+
+rule differential:
+    input: gene_counts=P + '/06_quantification/reference_gene_counts.tsv', transcript_counts=P + '/06_quantification/isoform_counts.tsv', catalog=P + '/06_quantification/catalog.tsv', samples=config['samples_tsv'], contrasts=config['contrasts_tsv'], script=DIFFERENTIAL, design=D
+    output: gene=P + '/08_differential/gene_de.tsv', transcript=P + '/08_differential/transcript_de.tsv', dtu_genes=P + '/08_differential/dtu_genes.tsv', dtu_transcripts=P + '/08_differential/dtu_transcripts.tsv', summary=P + '/08_differential/summary.json'
+    log: 'log/differential.log'
+    params: output_dir=P + '/08_differential'
+    resources: mem_mb=32000
+    shell: 'Rscript {input.script:q} --gene-counts {input.gene_counts:q} --transcript-counts {input.transcript_counts:q} --catalog {input.catalog:q} --samples {input.samples:q} --contrasts {input.contrasts:q} --output-dir {params.output_dir:q} > {log:q} 2>&1'
+
+rule read_flow_sankey:
+    input: samples=config['samples_tsv'], raw=expand(O + '/{sample}/01_raw_qc/qc.json', sample=SAMPLES), trims=expand(O + '/{sample}/02_trim/trim_summary.json', sample=SAMPLES), alignments=expand(O + '/{sample}/03_alignment/alignment.json', sample=SAMPLES), table_script=FLOW_TABLES, renderer=FLOW_RENDERER, validator=FLOW_VALIDATOR, plotly=PLOTLY_JS
+    output: directory(FLOW_DIR)
+    log: 'log/read_flow_sankey.log'
+    params: outputs=O, destination=FLOW_DIR, mapq=int(config.get('mapq', 20))
+    resources: mem_mb=4096
+    shell: 'python {input.table_script:q} --samples {input.samples:q} --outputs {params.outputs:q} --destination {params.destination:q} --mapq {params.mapq} && python {input.renderer:q} --nodes {params.destination:q}/read_flow_nodes.input.tsv --links {params.destination:q}/read_flow_links.input.tsv --views {params.destination:q}/read_flow_views.tsv --default-mode view --node-layout main_top_losses --orientation horizontal --plotly-js {input.plotly:q} --output-dir {params.destination:q} --title "ISO-seq conserved read flow" > {log:q} 2>&1 && python {input.validator:q} --output-dir {params.destination:q}'
+
+rule report:
+    input: quant=P + '/06_quantification/summary.json', events=P + '/07_events/events.json', differential=P + '/08_differential/summary.json', qc=expand(O + '/{sample}/01_raw_qc/qc.json', sample=SAMPLES), trims=expand(O + '/{sample}/02_trim/trim_summary.json', sample=SAMPLES), alignments=expand(O + '/{sample}/03_alignment/alignment.json', sample=SAMPLES), flow=FLOW_DIR, plotly=PLOTLY_JS, script=REPORT
+    output: html=P + '/09_report/report.html', manifest=P + '/09_report/delivery_manifest.tsv', status=P + '/09_report/workflow_status.json'
+    log: 'log/report.log'
+    params: settings=config
+    resources: mem_mb=16000
+    shell: 'python {input.script:q} --config {CFG:q} > {log:q} 2>&1'
+
+rule complete:
+    input: html=P + '/09_report/report.html', manifest=P + '/09_report/delivery_manifest.tsv', status=P + '/09_report/workflow_status.json', script=SCRIPT
+    output: P + '/RUN_COMPLETE.tsv'
+    log: 'log/completion.log'
+    resources: mem_mb=2048
+    shell: 'python {input.script:q} complete --config {CFG:q} > {log:q} 2>&1'

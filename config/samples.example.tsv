@@ -1,0 +1,5 @@
+sample_id	fastq	group	batch
+S01	inputs/S01.fastq.gz	Control	Batch1
+S02	inputs/S02.fastq.gz	Control	Batch2
+S03	inputs/S03.fastq.gz	Treatment	Batch1
+S04	inputs/S04.fastq.gz	Treatment	Batch2

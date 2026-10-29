@@ -1,0 +1,20 @@
+project_id: ISO-seq
+project_root: .
+inputs_root: inputs
+reference_root: reference
+log_root: log
+outputs_root: outputs
+pipeline_root: pipeline
+tmp_root: tmp
+snakefile: pipeline/Snakefile
+version_control: {system: git, required: true, dirty_policy: warn, provenance_file: git_provenance.tsv, release_tag_pattern: "pipeline-vX.Y.Z"}
+stages:
+  - {number: "01", id: raw_qc, rule: raw_qc, output_dir: "01_raw_qc"}
+  - {number: "02", id: trim, rule: orient, output_dir: "02_trim"}
+  - {number: "03", id: alignment, rule: align, output_dir: "03_alignment"}
+  - {number: "04", id: catalog, rule: isoquant, output_dir: "04_catalog"}
+  - {number: "05", id: structure_qc, rule: sqanti, output_dir: "05_structure_qc"}
+  - {number: "06", id: quantification, rule: quantification, output_dir: "06_quantification"}
+  - {number: "07", id: events, rule: events, output_dir: "07_events"}
+  - {number: "08", id: differential, rule: differential, output_dir: "08_differential"}
+  - {number: "09", id: report, rule: report, output_dir: "09_report", final_report: true}

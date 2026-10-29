@@ -1,0 +1,5 @@
+*
+!pipeline/
+!pipeline/docker/
+!pipeline/docker/environment.yaml
+!pipeline/docker/sqanti-environment.yaml

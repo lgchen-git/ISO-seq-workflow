@@ -1,0 +1,16 @@
+inputs/
+reference/
+log/
+outputs/
+tmp/
+__pycache__/
+*.pyc
+.snakemake
+config/run.yaml
+config/samples.tsv
+config/contrasts.tsv
+DATA_METRIC_*.md
+DEPLOY_TO_SERVER2.md
+*.html
+*.tar
+*.tar.gz

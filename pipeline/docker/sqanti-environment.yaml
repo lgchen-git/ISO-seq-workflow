@@ -1,0 +1,5 @@
+name: iso-seq-sqanti
+channels: [conda-forge, bioconda]
+dependencies:
+  - python=3.11
+  - sqanti3=6.0.1

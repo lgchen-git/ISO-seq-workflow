@@ -1,0 +1,22 @@
+name: iso-seq
+channels: [conda-forge, bioconda]
+dependencies:
+  - python=3.11
+  - snakemake-minimal=9.26.1
+  - isoquant=3.13.0
+  - suppa=2.4
+  - minimap2=2.31
+  - samtools=1.23.1
+  - cutadapt=5.2
+  - numpy=1.26.4
+  - pandas=2.2.3
+  - scipy=1.11.4
+  - matplotlib-base=3.10.9
+  - pysam=0.22.1
+  - pyyaml=6.0.3
+  - statsmodels=0.14.6
+  - r-base=4.5.3
+  - r-jsonlite=2.0.0
+  - bioconductor-edger=4.8.2
+  - bioconductor-drimseq=1.38.0
+  - bioconductor-stager=1.32.0
